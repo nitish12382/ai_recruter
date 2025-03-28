@@ -7,3 +7,4 @@ faiss-cpu==1.7.3
 pandas==2.1.4
 python-dotenv==1.0.0
 matplotlib==3.8.2
+groq==0.20.0  # Added missing Groq dependency

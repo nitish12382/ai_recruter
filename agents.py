@@ -41,20 +41,71 @@ class GroqLLM(LLM):
         return "groq"
 
 class ResumeAnalysisAgent:
-    def __init__(self, api_key):
-        """Initialize the ResumeAnalysisAgent with the provided API key"""
-        self.api_key = api_key
-        self.client = Groq(api_key=api_key)
+    def __init__(self):
+        """Initialize the ResumeAnalysisAgent with multiple API keys"""
+        # Load environment variables
+        load_dotenv()  # Ensure environment variables are loaded
+        
+        self.api_keys = {
+            'analysis': os.getenv('API_KEY_ANALYSIS'),
+            'qa': os.getenv('API_KEY_QA'),
+            'questions': os.getenv('API_KEY_QUESTIONS'),
+            'improvement': os.getenv('API_KEY_IMPROVEMENT'),
+            'improved_resume': os.getenv('API_KEY_IMPROVED_RESUME')
+        }
+        
+        # Initialize clients for each functionality
+        self.clients = {}
+        for key_type, api_key in self.api_keys.items():
+            if api_key:
+                self.clients[key_type] = Groq(api_key=api_key)
+                print(f"Initialized client for {key_type} with key {api_key[:10]}...")  # Debug print
+        
+        if not self.clients:
+            raise ValueError("No valid API keys found. Please check your .env file.")
+            
         self.vector_store = None
         self.resume_text = None
         self.role_requirements = None
-        self.llm = GroqLLM(client=self.client)
-        self.cutoff_score = 75
-        self.resume_weaknesses = []
-        self.resume_strengths = []
-        self.improvement_suggestions = {}
-        self.jd_text = None
+        self.analysis_cache = {}
+        self.current_key_index = 0
         self.extracted_skills = None
+        self.analysis_result = None
+        self.cutoff_score = 70  # Define the cutoff score
+        
+    def _get_client(self, functionality):
+        """Get client for specific functionality with fallback and rotation"""
+        if not self.clients:
+            raise ValueError("No API keys configured")
+            
+        # Try primary client for the functionality
+        if functionality in self.clients:
+            return self.clients[functionality]
+            
+        # Fallback to any available client using rotation
+        available_clients = list(self.clients.values())
+        if not available_clients:
+            raise ValueError("No available API clients")
+            
+        self.current_key_index = (self.current_key_index + 1) % len(available_clients)
+        return available_clients[self.current_key_index]
+    
+    def _get_llm(self, functionality):
+        """Get LLM instance for specific functionality"""
+        client = self._get_client(functionality)
+        return GroqLLM(client=client)
+    
+    def _handle_api_call(self, functionality, operation):
+        """Handle API calls with retries and error handling"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                client = self._get_client(functionality)
+                return operation(client)
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    raise Exception(f"Failed after {max_retries} attempts: {str(e)}")
+                continue
 
     def extract_text_from_pdf(self, pdf_file):
         """Extract text from a PDF file"""
@@ -159,7 +210,7 @@ class ResumeAnalysisAgent:
             Return only valid JSON, no other text
             """
 
-            response = self.llm(prompt)
+            response = self._get_llm('analysis')(prompt)
             weakness_content = response.strip()
             
             try:
@@ -193,7 +244,7 @@ class ResumeAnalysisAgent:
             {jd_text}
             """
 
-            response = self.llm(prompt)
+            response = self._get_llm('analysis')(prompt)
             skills_text = response
             match = re.search(r'\[(.*?)\]', skills_text, re.DOTALL)
             
@@ -228,7 +279,7 @@ class ResumeAnalysisAgent:
         vectorstore = self.create_vector_store(resume_text)
         retriever = vectorstore.as_retriever()
         qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
+            llm=self._get_llm('analysis'),
             retriever=retriever,
             return_source_documents=False
         )
@@ -270,61 +321,50 @@ class ResumeAnalysisAgent:
             "improvement_areas": improvement_areas
         }
 
-    def analyze_resume(self, resume_file, custom_jd=None):
-        """Analyze a resume and return the results"""
+    def analyze_resume(self, resume_file, role_requirements=None, custom_jd=None):
+        """Analyze resume with dedicated API key and cache results"""
         try:
-            # Extract text from PDF
-            self.resume_text = self.extract_text_from_pdf(resume_file)
+            # Extract text and prepare analysis
+            self.resume_text = self.extract_text_from_file(resume_file)
+            self.role_requirements = role_requirements
             
-            # Create vector store for RAG
-            self.vector_store = self.create_rag_vector_store(self.resume_text)
-            
-            # Get role requirements
-            if custom_jd:
-                if isinstance(custom_jd, dict):
-                    self.role_requirements = custom_jd
-                else:
-                    # If custom_jd is a string (file path), extract text from it
-                    self.role_requirements = {
-                        "role": "Custom Role",
-                        "requirements": self.extract_text_from_file(custom_jd)
-                    }
-            else:
-                self.role_requirements = {
-                    "role": "General Role",
-                    "requirements": "General requirements for resume analysis"
-                }
+            # Use analysis-specific API key
+            llm = self._get_llm('analysis')
             
             # Analyze resume
-            analysis_prompt = f"""Analyze this resume for the role of {self.role_requirements['role']}:
+            analysis_prompt = f"""Analyze this resume for the role of {self.role_requirements['role'] if self.role_requirements else 'General Role'}:
 
 Resume:
 {self.resume_text}
 
 Role Requirements:
-{self.role_requirements['requirements']}
+{self.role_requirements['requirements'] if self.role_requirements else 'General requirements for resume analysis'}
 
 Provide a detailed analysis in the following JSON format:
 {{
-    "score": <number between 0 and 100>,
+    "extracted_skills": [<list of technical and soft skills found in resume>],
     "strengths": [<list of strengths>],
     "weaknesses": [<list of weaknesses>],
+    "match_score": <number between 0 and 100, calculate based on role requirements match>,
     "improvement_suggestions": {{
         "technical": [<list of suggestions>],
         "experience": [<list of suggestions>],
         "education": [<list of suggestions>]
-    }},
-    "ats_keywords": [<list of keywords>]
+    }}
 }}
 
+IMPORTANT: Calculate match_score carefully by comparing resume skills and experience with role requirements. If no role requirements provided, base score on general resume quality.
 IMPORTANT: Respond ONLY with the JSON object, no additional text or explanations."""
-
-            # Get analysis from LLM
-            response = self.llm.invoke(analysis_prompt)
             
-            # Filter out the think section if present
-            if "<think>" in response:
-                response = response.split("</think>")[-1].strip()
+            # Get analysis from LLM
+            response = self._handle_api_call('analysis', lambda client: 
+                client.chat.completions.create(
+                    model="llama-3.3-70b-specdec",
+                    messages=[{"role": "user", "content": analysis_prompt}],
+                    temperature=0.7,
+                    max_tokens=1024
+                ).choices[0].message.content
+            )
             
             # Clean up the response to ensure it's valid JSON
             response = response.strip()
@@ -337,264 +377,340 @@ IMPORTANT: Respond ONLY with the JSON object, no additional text or explanations
             # Parse the response as JSON
             try:
                 analysis_result = json.loads(response)
+                # Ensure match_score is a number between 0 and 100
+                if 'match_score' in analysis_result:
+                    try:
+                        match_score = float(analysis_result['match_score'])
+                        analysis_result['match_score'] = max(0, min(100, match_score))
+                    except (ValueError, TypeError):
+                        analysis_result['match_score'] = 0
+                else:
+                    analysis_result['match_score'] = 0
             except json.JSONDecodeError:
                 # If JSON parsing fails, try to extract the JSON part
                 json_match = re.search(r'\{.*\}', response, re.DOTALL)
                 if json_match:
                     try:
                         analysis_result = json.loads(json_match.group())
+                        if 'match_score' in analysis_result:
+                            try:
+                                match_score = float(analysis_result['match_score'])
+                                analysis_result['match_score'] = max(0, min(100, match_score))
+                            except (ValueError, TypeError):
+                                analysis_result['match_score'] = 0
+                        else:
+                            analysis_result['match_score'] = 0
                     except json.JSONDecodeError:
-                        # If still failing, create a default result
                         analysis_result = {
-                            "score": 0,
+                            "extracted_skills": [],
                             "strengths": ["Unable to analyze strengths"],
                             "weaknesses": ["Unable to analyze weaknesses"],
+                            "match_score": 0,
                             "improvement_suggestions": {
                                 "technical": ["Unable to generate technical suggestions"],
                                 "experience": ["Unable to generate experience suggestions"],
                                 "education": ["Unable to generate education suggestions"]
-                            },
-                            "ats_keywords": ["Unable to extract keywords"]
+                            }
                         }
                 else:
                     raise ValueError("Could not parse analysis result as JSON")
             
-            # Store results
-            self.resume_weaknesses = analysis_result.get('weaknesses', [])
-            self.resume_strengths = analysis_result.get('strengths', [])
-            self.improvement_suggestions = analysis_result.get('improvement_suggestions', {})
-            
+            # Cache the results for other functionalities
+            self.analysis_cache = analysis_result
+            self.extracted_skills = analysis_result.get('extracted_skills', [])
+            self.analysis_result = analysis_result
             return analysis_result
             
         except Exception as e:
-            raise Exception(f"Error analyzing resume: {str(e)}")
+            st.error(f"Error in resume analysis: {str(e)}")
+            return None
 
     def ask_question(self, question):
-        """Ask a question about the resume"""
-        if not self.vector_store or not self.resume_text:
-            return "Please analyze a resume first."
-            
-        retriever = self.vector_store.as_retriever(search_kwargs={"k": 3})
-        
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=self.llm,
-            chain_type="stuff",
-            retriever=retriever,
-            return_source_documents=False
-        )
-        
-        response = qa_chain.run(question)
-        return response
-
-    def generate_interview_questions(self, question_types, difficulty, num_questions):
-        """Generate interview questions based on the resume"""
-        if not self.resume_text:
-            return []
-            
-        try:
-            # Get the analysis result if not already available
-            if not hasattr(self, 'analysis_result'):
-                self.analysis_result = self.analyze_resume(self.resume_file_path)
-            
-            # Get skills from the analysis result
-            skills = self.analysis_result.get('ats_keywords', [])
-            strengths = self.analysis_result.get('strengths', [])
-            weaknesses = self.analysis_result.get('weaknesses', [])
-            
-            context = f"""
-            Resume Content:
-            {self.resume_text[:2000]} ...
-            Skills to focus on: {', '.join(skills)}
-            Strengths: {', '.join(strengths)}
-            Areas for improvement: {', '.join(weaknesses)}
-            """
-            
-            prompt = f"""
-            Generate {num_questions} personalized {difficulty.lower()} level interview questions for this candidate
-            based on their resume and skills. Include only the following question types: {', '.join(question_types)}.
-
-            For each question:
-            1. Clearly label the question type
-            2. Make the question specific to their background and skills
-            3. For coding questions, include a clear problem statement
-
-            {context}
-            Format the response as a list of tuples with the question type and the question itself.
-            Each tuple should be in the format: ("Question Type", "Full Question Text")
-            """
-            
-            response = self.llm(prompt)
-            questions_text = response
-            
-            questions = []
-            pattern = r'[("]([^"]+)[",)\s]+[(",\s]+([^"]+)[")\s]+'
-            matches = re.findall(pattern, questions_text, re.DOTALL)
-            
-            for match in matches:
-                if len(match) >= 2:
-                    question_type = match[0].strip()
-                    question = match[1].strip()
-                    
-                    for requested_type in question_types:
-                        if requested_type.lower() in question_type.lower():
-                            questions.append((requested_type, question))
-                            break
-            
-            if not questions:
-                lines = questions_text.split('\n')
-                current_type = None
-                current_question = ""
-                
-                for line in lines:
-                    line = line.strip()
-                    if any(t.lower() in line.lower() for t in question_types) and not current_question:
-                        current_type = next((t for t in question_types if t.lower() in line.lower()), None)
-                    if ":" in line:
-                        current_question = line.split(":", 1)[1].strip()
-                    elif current_type and line:
-                        current_question += " " + line
-                    elif current_type and current_question:
-                        questions.append((current_type, current_question))
-                        current_type = None
-                        current_question = ""
-            
-            questions = questions[:num_questions]
-            return questions
-            
-        except Exception as e:
-            print(f"Error generating interview questions: {e}")
-            return []
-
-    def improve_resume(self, improvement_areas, target_role=""):
-        """Generate suggestions to improve the resume"""
-        if not self.resume_text:
-            return {}
-            
-        try:
-            improvements = {}
-            
-            # Get the analysis result if not already available
-            if not hasattr(self, 'analysis_result'):
-                self.analysis_result = self.analyze_resume(self.resume_file_path)
-            
-            # Generate improvements for each area
-            for area in improvement_areas:
-                if area == "Skills Highlighting":
-                    improvements[area] = {
-                        "description": "Your resume needs to better highlight key skills that are important for the role.",
-                        "specific": []
-                    }
-                    
-                    # Add specific suggestions based on weaknesses
-                    for weakness in self.resume_weaknesses:
-                        if isinstance(weakness, dict):
-                            skill_name = weakness.get("skill", "")
-                            if "suggestions" in weakness and weakness["suggestions"]:
-                                for suggestion in weakness["suggestions"]:
-                                    improvements[area]["specific"].append(f"{skill_name}: {suggestion}")
-                        else:
-                            improvements[area]["specific"].append(str(weakness))
-                
-                elif area == "Achievement Quantification":
-                    improvements[area] = {
-                        "description": "Your resume should include more quantifiable achievements and metrics.",
-                        "specific": [
-                            "Add specific numbers and percentages to your achievements",
-                            "Include metrics like revenue growth, cost savings, or performance improvements",
-                            "Quantify the impact of your work on business outcomes"
-                        ]
-                    }
-                
-                elif area == "Experience Relevance":
-                    improvements[area] = {
-                        "description": "Your experience section could be more relevant to the target role.",
-                        "specific": [
-                            "Focus on experiences that align with the role requirements",
-                            "Highlight relevant projects and their outcomes",
-                            "Emphasize transferable skills and achievements"
-                        ]
-                    }
-                
-                elif area == "Education Focus":
-                    improvements[area] = {
-                        "description": "Your education section could be more focused on relevant qualifications.",
-                        "specific": [
-                            "Highlight relevant coursework and academic achievements",
-                            "Include relevant certifications and training",
-                            "Emphasize research or projects related to the role"
-                        ]
-                    }
-                
-                elif area == "Professional Summary":
-                    improvements[area] = {
-                        "description": "Your professional summary could be more impactful.",
-                        "specific": [
-                            "Start with a strong opening statement",
-                            "Highlight key achievements and skills",
-                            "Align with the target role's requirements"
-                        ]
-                    }
-            
-            return improvements
-            
-        except Exception as e:
-            print(f"Error generating resume improvements: {e}")
-            # Return default improvements for each area
-            return {
-                area: {
-                    "description": f"Improvements needed in {area}",
-                    "specific": ["Review and enhance this section"]
-                } for area in improvement_areas
-            }
-        
-    def get_improved_resume(self, target_role="", highlight_skills=""):
-        """Get an improved version of the resume"""
+        """Ask questions about resume using QA-specific API key"""
         try:
             if not self.resume_text:
-                return ""
+                raise ValueError("No resume loaded")
                 
-            # Get the analysis result if not already available
-            if not hasattr(self, 'analysis_result'):
-                self.analysis_result = self.analyze_resume(self.resume_file_path)
-                
-            weaknesses_text = ""
-            for weakness in self.resume_weaknesses:
-                if isinstance(weakness, dict):
-                    skill_name = weakness.get("skill", "")
-                    if "suggestions" in weakness and weakness["suggestions"]:
-                        for suggestion in weakness["suggestions"]:
-                            weaknesses_text += f"For {skill_name}: {suggestion}\n"
-                else:
-                    weaknesses_text += f"{weakness}\n"
-                    
+            # Include cached analysis in prompt context
             context = f"""
-            Resume Content:
-            {self.resume_text[:2000]} ...
-            Strengths: {', '.join(self.resume_strengths)}
-            Areas for improvement: {', '.join(self.analysis_result.get('weaknesses', []))}
-            Weaknesses: {weaknesses_text}
+            Resume Analysis Context:
+            - Skills: {self.analysis_cache.get('extracted_skills', [])}
+            - Strengths: {self.analysis_cache.get('strengths', [])}
+            - Weaknesses: {self.analysis_cache.get('weaknesses', [])}
+            
+            Question: {question}
             """
             
-            prompt = f"""
-            Generate an improved version of the resume optimized for the role of {target_role}. 
-            Highlight the following skills: {highlight_skills}. 
-            Include specific suggestions for improvement and formatting. 
-            Format the resume in a modern, clean style with clear section headings.
-            {context}
-            """
-            
-            response = self.llm(prompt)
-            
-            # Create a temporary file for the improved resume
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.txt', mode='w', encoding='utf-8') as tmp:
-                tmp.write(response)
-                self.improved_resume_path = tmp.name
-                
-            return self.improved_resume_path
+            return self._handle_api_call('qa', lambda client: 
+                client.chat.completions.create(
+                    model="llama-3.3-70b-specdec",
+                    messages=[{"role": "user", "content": context}],
+                    temperature=0.7,
+                    max_tokens=1024
+                ).choices[0].message.content
+            )
             
         except Exception as e:
-            print(f"Error generating improved resume: {e}")
-            return ""
+            st.error(f"Error in resume Q&A: {str(e)}")
+            return None
+
+    def generate_interview_questions(self, question_types, difficulty, num_questions):
+        """Generate interview questions based on resume analysis"""
+        try:
+            llm = self._get_llm('questions')
+            
+            # Create prompt for interview questions
+            prompt = f"""Based on the following resume and role requirements, generate {num_questions} {difficulty}-level interview questions.
+            Focus on these types: {', '.join(question_types)}
+
+            Resume:
+            {self.resume_text}
+
+            Role Requirements:
+            {self.role_requirements['requirements'] if self.role_requirements else 'General requirements'}
+
+            Previous Analysis:
+            {json.dumps(self.analysis_cache, indent=2)}
+
+            Generate questions in this JSON format:
+            {{
+                "questions": [
+                    {{
+                        "type": "question type",
+                        "question": "actual question"
+                    }}
+                ]
+            }}
+
+            IMPORTANT: Return ONLY the JSON object, no additional text."""
+
+            # Get questions from LLM
+            response = self._handle_api_call('questions', lambda client: 
+                client.chat.completions.create(
+                    model="llama-3.3-70b-specdec",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=1024
+                ).choices[0].message.content
+            )
+            
+            return response
+
+        except Exception as e:
+            st.error(f"Error generating interview questions: {str(e)}")
+            return None
+
+    def improve_resume(self, areas=None, role=None):
+        """Generate improvement suggestions using improvement-specific API key"""
+        try:
+            llm = self._get_llm('improvement')
+            
+            # Get weaknesses from analysis
+            weaknesses = self.analysis_cache.get('weaknesses', []) if self.analysis_cache else []
+            
+            # Create prompt for improvements
+            prompt = f"""Based on the following resume and analysis, provide specific improvement suggestions.
+
+Original Resume:
+{self.resume_text}
+
+Role Requirements:
+{self.role_requirements['requirements'] if self.role_requirements else 'General requirements'}
+
+Previous Analysis:
+{json.dumps(self.analysis_cache, indent=2)}
+
+Identified Weaknesses:
+{chr(10).join('- ' + w for w in weaknesses)}
+
+Focus Areas: {areas if areas else 'All areas'}
+Target Role: {role if role else self.role_requirements.get('role', 'Not specified')}
+
+Generate improvement suggestions in this JSON format:
+{{
+    "content": {{
+        "weaknesses_improvement": [
+            {{
+                "weakness": "specific weakness",
+                "detailed_explanation": "explanation of why this is a weakness",
+                "improvement_steps": [
+                    "list of specific steps to improve this weakness"
+                ]
+            }}
+        ],
+        "skills": [
+            "list of skill improvements"
+        ],
+        "experience": [
+            "list of experience improvements"
+        ],
+        "education": [
+            "list of education improvements"
+        ],
+        "format": [
+            "list of formatting improvements"
+        ]
+    }}
+}}
+
+IMPORTANT: Return ONLY the JSON object, no additional text."""
+
+            # Get improvements from LLM
+            response = self._handle_api_call('improvement', lambda client: 
+                client.chat.completions.create(
+                    model="llama-3.3-70b-specdec",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=1024
+                ).choices[0].message.content
+            )
+            
+            # Clean up the response
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response[7:]
+            if response.endswith("```"):
+                response = response[:-3]
+            response = response.strip()
+            
+            # Try to parse as JSON
+            try:
+                improvements = json.loads(response)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, try to extract the JSON part
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    try:
+                        improvements = json.loads(json_match.group())
+                    except json.JSONDecodeError:
+                        improvements = {
+                            "content": {
+                                "weaknesses_improvement": [
+                                    {
+                                        "weakness": "Error generating improvements",
+                                        "detailed_explanation": "Please try again",
+                                        "improvement_steps": []
+                                    }
+                                ],
+                                "skills": ["Error generating improvements"],
+                                "experience": [],
+                                "education": [],
+                                "format": []
+                            }
+                        }
+                else:
+                    raise ValueError("Could not parse improvements as JSON")
+            
+            return improvements
+
+        except Exception as e:
+            st.error(f"Error generating improvement suggestions: {str(e)}")
+            return None
+
+    def get_improved_resume(self, role=None, skills=None):
+        """Generate an improved version of the resume using improved-resume-specific API key"""
+        try:
+            llm = self._get_llm('improved_resume')
+            
+            # Create prompt for improved resume
+            prompt = f"""Based on the following resume and analysis, generate an improved version of the resume.
+
+Original Resume:
+{self.resume_text}
+
+Role Requirements:
+{self.role_requirements['requirements'] if self.role_requirements else 'General requirements'}
+
+Target Role: {role if role else self.role_requirements.get('role', 'Not specified')}
+Skills to Highlight: {', '.join(skills) if skills else 'All relevant skills'}
+
+Previous Analysis:
+{json.dumps(self.analysis_cache, indent=2)}
+
+Generate an improved resume in this JSON format:
+{{
+    "sections": {{
+        "professional_summary": "improved summary text",
+        "skills": [
+            "list of improved and reformatted skills"
+        ],
+        "experience": [
+            {{
+                "title": "job title",
+                "company": "company name",
+                "duration": "duration",
+                "achievements": [
+                    "list of improved bullet points"
+                ]
+            }}
+        ],
+        "education": [
+            {{
+                "degree": "degree name",
+                "institution": "institution name",
+                "duration": "duration",
+                "details": [
+                    "list of relevant details"
+                ]
+            }}
+        ],
+        "certifications": [
+            {{
+                "name": "certification name",
+                "issuer": "issuer name",
+                "date": "date"
+            }}
+        ]
+    }}
+}}
+
+IMPORTANT: Return ONLY the JSON object, no additional text."""
+
+            # Get improved resume from LLM
+            response = self._handle_api_call('improved_resume', lambda client: 
+                client.chat.completions.create(
+                    model="llama-3.3-70b-specdec",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=2048
+                ).choices[0].message.content
+            )
+            
+            # Clean up the response
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response[7:]
+            if response.endswith("```"):
+                response = response[:-3]
+            response = response.strip()
+            
+            # Try to parse as JSON
+            try:
+                improved_resume = json.loads(response)
+            except json.JSONDecodeError:
+                # If JSON parsing fails, try to extract the JSON part
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    try:
+                        improved_resume = json.loads(json_match.group())
+                    except json.JSONDecodeError:
+                        improved_resume = {
+                            "sections": {
+                                "professional_summary": "Error generating improved resume",
+                                "skills": ["Please try again"],
+                                "experience": [],
+                                "education": [],
+                                "certifications": []
+                            }
+                        }
+                else:
+                    raise ValueError("Could not parse improved resume as JSON")
+            
+            return improved_resume
+
+        except Exception as e:
+            st.error(f"Error generating improved resume: {str(e)}")
+            return None
 
     def cleanup(self):
         """Clean up temporary files"""
@@ -607,6 +723,6 @@ IMPORTANT: Respond ONLY with the JSON object, no additional text or explanations
 # Example usage (e.g., in a Streamlit app or main script)
 if __name__ == "__main__":
     # Test the agent
-    agent = ResumeAnalysisAgent("your-api-key-here")
+    agent = ResumeAnalysisAgent()
     result = agent.analyze_resume("path/to/resume.pdf")
     print(result)
